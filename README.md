@@ -12,13 +12,13 @@
 
 | 服务 | 支持操作 |
 |------|---------|
-| **Gmail** | 搜索、读取、发送、回复、标签 |
-| **Calendar** | 列出 / 创建 / 删除事件 |
+| **Gmail** | 搜索 (`--format ids` 管道化)、读取 (`--format json/text/markdown`)、发送 / 回复（支持多附件 & HTML）、标签管理 |
+| **Calendar** | 列出、创建（`--duration 1h30m`）、**更新**、删除（`--notify`） |
 | **Tasks** | 任务列表、列出任务、添加（含 due）、标记完成 |
 | **Sheets** | 读范围、写入、追加行 |
 | **Docs** | 读取正文（纯文本） |
 | **Drive** | 搜索（只读） |
-| **Contacts** | 列出联系人（People API） |
+| **Contacts** | 列出 & 按姓名过滤（People API） |
 
 写入类操作建议由 Agent **先展示草稿再执行**（策略层；本仓库 CLI 会直接调用 Google API）。
 
@@ -28,19 +28,23 @@
 
 | 项目 | 说明 |
 |------|------|
-| **OAuth scope单一来源** |所有 scope 只在 `scripts/scopes.py` 定义，`setup.py` 与 `google_api.py` 统一导入，避免「授权了 A、CLI 却要 B」的隐性故障。 |
-| **Profile 目录** | 由 `scripts/_gws_env.py` 解析：可选 `GOOGLE_WORKSPACE_STATE_DIR`，否则 Hermes 内用 `hermes_constants`，再否则 `HERMES_HOME` / `OPENCLAW_HOME`，默认 `~/.hermes`（兼容旧版）。 |
-| **独立仓库可运行** | 旧版在找不到 `hermes_constants` 时用错误的 `Path.parents[4]` 回退，会在独立 clone 下 **IndexError**；已改为不依赖该回退。 |
-| **Calendar list时区** | 已修复「在 for 循环里改局部变量但未写回 `time_min` / `time_max`」导致 RFC3339 未补 `Z` 的问题。 |
-| **Gmail / Contacts** | 旧版文档宣称支持，但 OAuth 列表未包含对应 scope；已在 `scopes.py` 中补齐（升级后需 **重新授权**）。 |
-| **Tasks** | 已提供 `google_api.py tasks …` 子命令，无需再手写 Python 片段。 |
+| **OAuth scope 单一来源** | 所有 scope 只在 `scripts/scopes.py` 定义；`setup.py`、`google_api.py` 统一导入，CI 强制 grep 保证。 |
+| **共享模块** | `scripts/_gws_common.py` 提供 `@api_call` 装饰器（HttpError → 结构化 JSON 到 stderr、exit 2）、scope 比对、`print_json`，避免重复。 |
+| **Profile 目录** | `scripts/_gws_env.py` 解析顺序：`GOOGLE_WORKSPACE_STATE_DIR` → Hermes `hermes_constants` → `HERMES_HOME` / `OPENCLAW_HOME` → `~/.hermes`。 |
+| **独立仓库可运行** | 去掉错误的 `Path.parents[4]` 回退，单独 clone 也能工作。 |
+| **Calendar list 时区** | 修复「写回 time_min / time_max」bug，RFC3339 `Z` 补齐逻辑有单测覆盖。 |
+| **Gmail / Contacts scope 补齐** | 新增 `gmail.modify` / `contacts.readonly` / `drive.readonly`，升级后需 **重新授权**。 |
+| **Tasks CLI 子命令** | `tasks tasklists / list / add / complete`，不再需要手写 Python。 |
+| **打包** | 支持 `pip install` 后得到 `gws` / `gws-setup`（`pyproject.toml`），也支持 `npx` 与直接脚本调用。 |
+| **测试** | `tests/test_pure_helpers.py` 覆盖纯逻辑：时区归一化、duration 解析、Gmail body 抽取、scope 比对。 |
 
 ---
 
 ## 环境要求
 
-- Python **3.8+**（推荐3.11+）
-- Google 账号 / Workspace- 在 [Google Cloud Console](https://console.cloud.google.com/apis/credentials) 创建 **Desktop OAuth客户端**，并启用所需 API（含 **People API** 若要用通讯录）
+- Python **3.9+**（推荐 3.11+）
+- Google 账号 / Workspace
+- 在 [Google Cloud Console](https://console.cloud.google.com/apis/credentials) 创建 **Desktop OAuth 客户端**，并启用所需 API（含 **People API** 若要用通讯录）
 
 ---
 
@@ -52,20 +56,31 @@
 hermes skills install google-workspace
 ```
 
-### B. 克隆本仓库（最通用）
+### B. `pip install`（推荐，得到 `gws` / `gws-setup`）
+
+```bash
+pip install --user git+https://github.com/BruceLanLan/hermes-google-workspace.git
+gws --version        # gws 2.2.0
+gws-setup --check
+```
+
+或本地开发：
 
 ```bash
 git clone https://github.com/BruceLanLan/hermes-google-workspace.git
 cd hermes-google-workspace
+pip install -e ".[test]" && pytest -q
 ```
 
-依赖可在首次 `setup.py` 时自动安装，或手动：
+### C. 直接运行脚本
 
 ```bash
-python3 -m pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
+git clone https://github.com/BruceLanLan/hermes-google-workspace.git
+python3 -m pip install -r hermes-google-workspace/requirements.txt
+python3 hermes-google-workspace/scripts/google_api.py --help
 ```
 
-### C. npm / npx（可选，需 Node）
+### D. npm / npx（需 Node）
 
 本仓库提供 `gws` / `gws-setup` 两个 bin，实质是调用上面的 Python 脚本。发布至 npm 后可用：
 
@@ -93,7 +108,14 @@ gws-setup --check
 
 ## 命令别名（推荐给 Agent 的 shell 片段）
 
-把 `GWORKSPACE_SKILL_DIR` 换成你的克隆路径；若在 Hermes skill 目录，则换成 `$HERMES_HOME/skills/productivity/google-workspace`。
+安装为包后，Agent 直接使用即可：
+
+```bash
+GSETUP="gws-setup"
+GAPI="gws"
+```
+
+若用脚本模式，把 `GWORKSPACE_SKILL_DIR` 换成你的克隆路径（Hermes skill 目录即 `$HERMES_HOME/skills/productivity/google-workspace`）：
 
 ```bash
 GWORKSPACE_SKILL_DIR="$HOME/src/hermes-google-workspace"
@@ -133,8 +155,11 @@ export GOOGLE_WORKSPACE_STATE_DIR="$HOME/.config/google-workspace-cli"
 
 ```bash
 $GAPI gmail search "is:unread newer_than:1d" --max 10
-$GAPI gmail get MESSAGE_ID
-$GAPI gmail send --to user@example.com --subject "Hello" --body "Message" --html
+$GAPI gmail search "from:boss is:unread" --format ids        # 可管道化
+$GAPI gmail get MESSAGE_ID --format markdown                  # 便于 Agent 总结
+$GAPI gmail send --to user@example.com --subject "Hello" \
+  --body "<h1>Hi</h1>" --html \
+  --attachment ~/slides.pdf --attachment ~/notes.txt
 $GAPI gmail reply MESSAGE_ID --body "Thanks!"
 $GAPI gmail labels
 $GAPI gmail modify MESSAGE_ID --add-labels STARRED --remove-labels UNREAD
@@ -147,12 +172,19 @@ Gmail 搜索语法见 `references/gmail-search-syntax.md`。
 ```bash
 $GAPI calendar list
 $GAPI calendar list --start 2026-04-20T00:00:00Z --end 2026-04-25T23:59:59Z
+
+# 创建：--end 或 --duration 二选一
 $GAPI calendar create \
   --summary "Team Standup" \
   --start 2026-04-20T09:00:00-05:00 \
-  --end 2026-04-20T09:30:00-05:00 \
+  --duration 30m \
   --attendees "alice@co.com,bob@co.com"
-$GAPI calendar delete EVENT_ID
+
+# 更新（可以只改 summary / 时间 / 参会人）
+$GAPI calendar update EVENT_ID --start 2026-04-20T10:00:00-05:00 --duration 45m
+
+# 删除；--notify 会给参会人发取消邮件
+$GAPI calendar delete EVENT_ID --notify
 ```
 
 ### Tasks
@@ -184,15 +216,32 @@ $GAPI contacts list --max 20
 
 ---
 
+## 错误契约（agents 友好）
+
+成功返回 **exit 0** + stdout 的 JSON。失败时 `@api_call` 装饰器写结构化 JSON 到 **stderr** 并以 **exit 2** 退出，形如：
+
+```json
+{
+  "ok": false,
+  "error": "HttpError",
+  "message": "...",
+  "http_status": 403,
+  "google": { "error": { "message": "Insufficient Permission", "status": "PERMISSION_DENIED" } }
+}
+```
+
+---
+
 ## 故障排除
 
 | 现象 | 处理 |
 |------|------|
 | `NOT_AUTHENTICATED` | 完成 OAuth 流程 |
 | `AUTH_SCOPE_MISMATCH` / `Insufficient Permission` | 检查 `scripts/scopes.py`，修改后重新授权 |
-| `ModuleNotFoundError` | `$GSETUP --install-deps` 或手动 pip安装 |
+| `ModuleNotFoundError` | `gws-setup --install-deps` 或 `pip install -r requirements.txt` |
 | `Access Not Configured` | Cloud Console 启用对应 API |
 | 从 2.1 之前的版本升级后出现 Gmail/通讯录 403 | 新 scope 需重新走 `--auth-url` / `--auth-code` |
+| CLI 出错 | 所有 handler 都会把 `HttpError` 转成 stderr 的结构化 JSON，并以 exit code **2** 退出，便于 Agent 分析 |
 
 ---
 
@@ -202,13 +251,21 @@ $GAPI contacts list --max 20
 hermes-google-workspace/
 ├── README.md / README.en.md
 ├── SKILL.md                 # Hermes skill 元数据 + 说明
-├── package.json             # 可选 npx / npm 全局安装
+├── LICENSE                  # MIT
+├── pyproject.toml           # pip install → gws / gws-setup
+├── requirements.txt
+├── package.json             # npx / npm 全局安装
 ├── bin/gws.cjs / gws-setup.cjs
 ├── scripts/
+│   ├── __init__.py          # 安装后包名 gws_cli
 │   ├── scopes.py            # 唯一 OAuth scope 列表
 │   ├── _gws_env.py          # token 目录解析
+│   ├── _gws_common.py       # @api_call 装饰器 / JSON 输出
 │   ├── setup.py             # OAuth
 │   └── google_api.py        # CLI
+├── tests/
+│   └── test_pure_helpers.py # pytest（纯逻辑）
+├── .github/workflows/test.yml
 └── references/
     └── gmail-search-syntax.md
 ```

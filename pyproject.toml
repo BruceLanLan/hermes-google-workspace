@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-google-workspace"
+version = "2.2.0"
+description = "Google Workspace OAuth2 + CLI for AI agents (Hermes, OpenClaw, Claude Code, Cursor, ...)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Bruce Lan" }]
+keywords = ["google-workspace", "gmail", "calendar", "oauth2", "ai-agent", "cli", "hermes"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: OS Independent",
+  "Topic :: Communications :: Email",
+  "Topic :: Office/Business :: Scheduling",
+  "Environment :: Console",
+]
+dependencies = [
+  "google-api-python-client>=2.120.0",
+  "google-auth-oauthlib>=1.2.0",
+  "google-auth-httplib2>=0.2.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.urls]
+Homepage = "https://github.com/BruceLanLan/hermes-google-workspace"
+Issues = "https://github.com/BruceLanLan/hermes-google-workspace/issues"
+
+[project.scripts]
+gws = "gws_cli.google_api:main"
+gws-setup = "gws_cli.setup:main"
+
+[tool.setuptools]
+packages = ["gws_cli"]
+
+[tool.setuptools.package-dir]
+gws_cli = "scripts"

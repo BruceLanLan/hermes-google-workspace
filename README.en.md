@@ -2,9 +2,9 @@
 
 [← 中文说明](README.md)
 
-Give **any AI that can run terminal commands** (Hermes, OpenClaw, Claude Code, Cursor agents, etc.) a **single OAuth2 + CLI layer** for Google Workspace: Gmail, Calendar, Tasks, Sheets, Docs (read), Drive (read), and Contacts.
+Give **any AI that can run terminal commands** (Hermes, OpenClaw, Claude Code, Cursor agents, etc.) a **single OAuth2 + CLI layer** for Google Workspace: Gmail, Calendar, Tasks, Sheets, Docs (read), Drive (read), Contacts.
 
-**Design:** the **agent orchestrates** (sends the OAuth URL, collects the redirect URL, confirms writes). **Credentials and API calls live in this repo’s Python scripts**, so the integration is not tied to a specific chat product.
+**Design:** the **agent orchestrates** (sends the OAuth URL, collects the redirect URL, confirms writes). **Credentials and API calls live in this repo**, so the integration is not tied to any specific chat product.
 
 ---
 
@@ -12,40 +12,43 @@ Give **any AI that can run terminal commands** (Hermes, OpenClaw, Claude Code, C
 
 | Service | Operations |
 |---------|------------|
-| **Gmail** | Search, read, send, reply, labels |
-| **Calendar** | List / create / delete events |
+| **Gmail** | Search (`--format ids` for piping), get (`--format json/text/markdown`), send / reply (multi-attachment + HTML), labels |
+| **Calendar** | List, create (`--duration 1h30m`), **update**, delete (`--notify`) |
 | **Tasks** | Task lists, list tasks, add (with due), complete |
 | **Sheets** | Read range, update, append |
 | **Docs** | Read plain text |
 | **Drive** | Search (read-only) |
-| **Contacts** | List connections (People API) |
+| **Contacts** | List and filter by name (People API) |
 
-For mutating actions, have the agent **show a draft and ask for confirmation** (policy layer; the CLI here calls Google APIs directly).
+Have your agent **show a draft and ask for confirmation** before mutating calls (policy layer; the CLI here calls Google APIs directly).
 
 ---
 
-## Design notes (review summary)
+## Design notes
 
 | Topic | Detail |
 |-------|--------|
-| **Single scope source** | All OAuth scopes live in `scripts/scopes.py` and are imported by both `setup.py` and `google_api.py`, so consent and CLI validation cannot drift. |
-| **Profile directory** | Resolved in `scripts/_gws_env.py`: optional `GOOGLE_WORKSPACE_STATE_DIR`, else `hermes_constants` inside Hermes, else `HERMES_HOME` / `OPENCLAW_HOME`, default `~/.hermes` (backward compatible). |
-| **Standalone clone** | Older code used an invalid `Path.parents[4]` fallback when `hermes_constants` was missing, which could **IndexError** outside a full Hermes tree. That path is removed. |
-| **Calendar list / RFC3339** | Fixed a bug where timezone normalization modified a loop variable but never updated `time_min` / `time_max`. |
-| **Gmail / Contacts** | Docs claimed support, but OAuth scopes were incomplete; `scopes.py` now includes the right scopes (**re-consent after upgrade**). |
-| **Tasks** | Native `google_api.py tasks …` subcommands replace ad-hoc Python snippets. |
+| **Single scope source** | All OAuth scopes live in `scripts/scopes.py` and are imported by both entry points; CI blocks re-introducing `SCOPES` elsewhere. |
+| **Shared module** | `scripts/_gws_common.py` provides an `@api_call` decorator (`HttpError` → structured JSON on stderr, exit 2), scope diffing, and `print_json`. |
+| **Profile directory** | Resolved in `scripts/_gws_env.py`: `GOOGLE_WORKSPACE_STATE_DIR` → Hermes `hermes_constants` → `HERMES_HOME` / `OPENCLAW_HOME` → `~/.hermes` (backward compatible). |
+| **Standalone clone** | Removed the broken `Path.parents[4]` fallback from the original skill. |
+| **Calendar RFC3339** | Fixed `time_min` / `time_max` normalization; covered by pytest. |
+| **Gmail / Contacts scopes** | Added `gmail.modify` / `contacts.readonly` / `drive.readonly` (**re-consent after upgrade**). |
+| **Tasks subcommands** | `tasks tasklists / list / add / complete` replace the earlier Python snippets. |
+| **Packaging** | `pip install` exposes `gws` / `gws-setup` via `pyproject.toml`. `npx` and direct-script invocations still work. |
+| **Tests** | `tests/test_pure_helpers.py` covers pure helpers without hitting Google. |
 
 ---
 
 ## Requirements
 
-- Python **3.8+** (3.11+ recommended)
+- Python **3.9+** (3.11+ recommended)
 - Google account / Workspace
-- A **Desktop** OAuth client in [Google Cloud Console](https://console.cloud.google.com/apis/credentials) and APIs enabled (including **People API** for Contacts)
+- **Desktop** OAuth client in [Google Cloud Console](https://console.cloud.google.com/apis/credentials); enable Gmail / Calendar / Tasks / Sheets / Docs / Drive / People API as needed.
 
 ---
 
-## Installation
+## Install
 
 ### A. Hermes marketplace (if your distribution ships it)
 
@@ -53,48 +56,53 @@ For mutating actions, have the agent **show a draft and ask for confirmation** (
 hermes skills install google-workspace
 ```
 
-### B. Clone (most portable)
+### B. `pip install` (recommended)
+
+```bash
+pip install --user git+https://github.com/BruceLanLan/hermes-google-workspace.git
+gws --version        # gws 2.2.0
+gws-setup --check
+```
+
+Or for development:
 
 ```bash
 git clone https://github.com/BruceLanLan/hermes-google-workspace.git
 cd hermes-google-workspace
+pip install -e ".[test]" && pytest -q
 ```
 
-Dependencies install on first `setup.py` run, or manually:
+### C. Run scripts directly
 
 ```bash
-python3 -m pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
+git clone https://github.com/BruceLanLan/hermes-google-workspace.git
+python3 -m pip install -r hermes-google-workspace/requirements.txt
+python3 hermes-google-workspace/scripts/google_api.py --help
 ```
 
-### C. npm / npx (optional, requires Node)
+### D. npm / npx (requires Node)
 
-Bins `gws` / `gws-setup` wrap the Python CLIs. After publish:
-
-```bash
-npx -y -p hermes-google-workspace gws-setup --check
-npx -y -p hermes-google-workspace gws gmail search "is:unread" --max 5
-```
-
-Before npm publish, use a local path or GitHub (depending on npm support):
+Bins `gws` / `gws-setup` wrap the Python CLIs.
 
 ```bash
 npx -y -p github:BruceLanLan/hermes-google-workspace gws-setup --help
-```
-
-Global install:
-
-```bash
 npm install -g github:BruceLanLan/hermes-google-workspace
-gws-setup --check
 ```
 
-Custom Python: `GWS_PYTHON=/usr/bin/python3 gws calendar list`
+Override interpreter: `GWS_PYTHON=/usr/bin/python3 gws calendar list`
 
 ---
 
 ## Shell aliases for agents
 
-Point `GWORKSPACE_SKILL_DIR` at your clone (or `$HERMES_HOME/skills/productivity/google-workspace` inside Hermes).
+After `pip install` the agent can use bare commands:
+
+```bash
+GSETUP="gws-setup"
+GAPI="gws"
+```
+
+Script mode:
 
 ```bash
 GWORKSPACE_SKILL_DIR="$HOME/src/hermes-google-workspace"
@@ -134,12 +142,13 @@ Revoke: `$GSETUP --revoke`
 
 ```bash
 $GAPI gmail search "is:unread newer_than:1d" --max 10
-$GAPI gmail get MESSAGE_ID
-$GAPI gmail send --to user@example.com --subject "Hello" --body "Message" --html
+$GAPI gmail search "from:boss is:unread" --format ids
+$GAPI gmail get MESSAGE_ID --format markdown
+$GAPI gmail send --to user@example.com --subject "Hello" \
+  --body "<h1>Hi</h1>" --html \
+  --attachment ~/slides.pdf --attachment ~/notes.txt
 $GAPI gmail reply MESSAGE_ID --body "Thanks!"
 ```
-
-See `references/gmail-search-syntax.md` for search operators.
 
 ### Calendar
 
@@ -148,8 +157,10 @@ $GAPI calendar list
 $GAPI calendar create \
   --summary "Standup" \
   --start 2026-04-20T09:00:00-05:00 \
-  --end 2026-04-20T09:30:00-05:00
-$GAPI calendar delete EVENT_ID
+  --duration 30m \
+  --attendees "team@co.com"
+$GAPI calendar update EVENT_ID --duration 45m
+$GAPI calendar delete EVENT_ID --notify
 ```
 
 ### Tasks
@@ -161,22 +172,38 @@ $GAPI tasks add --tasklist TASKLIST_ID --title "Buy milk" --due "2026-04-20T00:0
 $GAPI tasks complete --tasklist TASKLIST_ID --task TASK_ID
 ```
 
-### Sheets, Docs, Drive, Contacts
+### Sheets / Docs / Drive / Contacts
 
 ```bash
 $GAPI sheets get "SHEET_ID" "Sheet1!A1:D10"
 $GAPI docs get DOC_ID
 $GAPI drive search "report" --max 10
-$GAPI contacts list --max 20
+$GAPI contacts list --name "Alice"
 ```
 
 ---
 
 ## Slack, Discord, Telegram, WeChat, etc.
 
-Those apps **do not implement Google APIs**. Any agent runtime that can execute your `$GSETUP` / `$GAPI` (or `gws` / `gws-setup`) works the same as local CLI: share OAuth URL → user signs in → paste redirect URL → subsequent calls reuse the token profile.
+Those apps **do not implement Google APIs**. Any agent runtime that can execute your `$GSETUP` / `$GAPI` (or `gws` / `gws-setup`) works the same as local CLI: share the OAuth URL, user signs in, paste redirect URL, subsequent calls reuse the token profile.
 
-If a channel cannot run commands on the host that holds tokens, complete OAuth on a machine that can, and point `GOOGLE_WORKSPACE_STATE_DIR` at that token directory.
+If a channel cannot run commands on the machine that stores tokens, complete OAuth on a machine that can, and point `GOOGLE_WORKSPACE_STATE_DIR` there.
+
+---
+
+## Error contract
+
+Every command returns **exit 0** on success and writes JSON to stdout. On failure the `@api_call` decorator writes a structured JSON object to **stderr** and exits with code **2**:
+
+```json
+{
+  "ok": false,
+  "error": "HttpError",
+  "message": "...",
+  "http_status": 403,
+  "google": { "error": { "message": "Insufficient Permission", "status": "PERMISSION_DENIED" } }
+}
+```
 
 ---
 
@@ -186,7 +213,7 @@ If a channel cannot run commands on the host that holds tokens, complete OAuth o
 |---------|-----|
 | `NOT_AUTHENTICATED` | Finish OAuth |
 | `AUTH_SCOPE_MISMATCH` / `Insufficient Permission` | Edit `scripts/scopes.py`, re-authorize |
-| `ModuleNotFoundError` | `$GSETUP --install-deps` or pip install |
+| `ModuleNotFoundError` | `gws-setup --install-deps` or `pip install -r requirements.txt` |
 | `Access Not Configured` | Enable API in Cloud Console |
 | Gmail/Contacts 403 after upgrading from pre-2.1 | New scopes require a fresh `--auth-url` / `--auth-code` |
 
@@ -198,13 +225,21 @@ If a channel cannot run commands on the host that holds tokens, complete OAuth o
 hermes-google-workspace/
 ├── README.md / README.en.md
 ├── SKILL.md
+├── LICENSE
+├── pyproject.toml
+├── requirements.txt
 ├── package.json
 ├── bin/gws.cjs / gws-setup.cjs
 ├── scripts/
+│   ├── __init__.py
 │   ├── scopes.py
 │   ├── _gws_env.py
+│   ├── _gws_common.py
 │   ├── setup.py
 │   └── google_api.py
+├── tests/
+│   └── test_pure_helpers.py
+├── .github/workflows/test.yml
 └── references/
     └── gmail-search-syntax.md
 ```

@@ -1,7 +1,7 @@
 ---
 name: google-workspace
 description: Gmail, Calendar, Tasks, Sheets, Docs, Drive, Contacts — OAuth2 with auto-refresh; works with Hermes, OpenClaw, and any terminal agent/CLI.
-version: 2.1.0
+version: 2.2.0
 author: Hermes Agent Community
 license: MIT
 tags: [Google, Gmail, Calendar, Tasks, Sheets, Docs, Drive, Contacts, OAuth]
@@ -28,8 +28,8 @@ Gmail、Calendar、Tasks、Sheets、Docs、Drive、Contacts — 通过 Google OA
 
 | 服务 | 读取 | 写入 | 备注 |
 |------|------|------|------|
-| Gmail | ✅ search, get, labels | ✅ send, reply, modify | 支持 HTML；发送前确认 |
-| Calendar | ✅ list | ✅ create, delete | ISO 8601 带时区 |
+| Gmail | ✅ search (`--format ids`), get (`--format json/text/markdown`), labels | ✅ send / reply（`--attachment`, HTML）, modify | 发送前建议由 Agent 确认 |
+| Calendar | ✅ list | ✅ create / update / delete | ISO 8601 带时区；`create --duration 30m` 可省 `--end` |
 | Tasks | ✅ tasklists, list | ✅ add（insert+patch）, complete | `google_api.py tasks …` |
 | Sheets | ✅ get | ✅ update, append | 需先查 tab 名 |
 | Docs | ✅ get（纯文本） | ❌ | 只读 |
@@ -42,6 +42,8 @@ Gmail、Calendar、Tasks、Sheets、Docs、Drive、Contacts — 通过 Google OA
 - `scripts/google_api.py` — Google API 的 CLI 封装
 - `scripts/scopes.py` — **唯一**的 OAuth scope 列表（`setup.py` 与 `google_api.py` 均从这里导入）
 - `scripts/_gws_env.py` — 解析 token 存放目录（Hermes / OpenClaw / 自定义）
+- `scripts/_gws_common.py` — 共享的错误装饰器、scope 比对、JSON 输出
+- `tests/test_pure_helpers.py` — 纯逻辑单元测试（不触网）
 - `references/gmail-search-syntax.md` — Gmail 搜索操作符完整参考
 
 ## 快速安装
@@ -141,8 +143,13 @@ $GAPI gmail search "is:unread newer_than:1d" --max 10
 # 读取
 $GAPI gmail get MESSAGE_ID
 
-# 发送（发送前展示草稿并确认）
-$GAPI gmail send --to user@example.com --subject "Report" --body "<h1>Q4</h1>" --html
+# 发送（发送前展示草稿并确认）；--attachment 可多次
+$GAPI gmail send --to user@example.com --subject "Report" --body "<h1>Q4</h1>" --html \
+  --attachment ~/slides.pdf --attachment ~/notes.txt
+
+# 供 Agent 总结：--format markdown / text；或用 --format ids 管道化
+$GAPI gmail get MESSAGE_ID --format markdown
+$GAPI gmail search "from:boss is:unread" --format ids | xargs -I{} $GAPI gmail modify {} --add-labels STARRED
 
 # 回复（自动 threading + In-Reply-To）
 $GAPI gmail reply MESSAGE_ID --body "Got it, thanks!"
@@ -158,16 +165,19 @@ $GAPI gmail modify MESSAGE_ID --add-labels STARRED --remove-labels UNREAD
 # 列表（默认未来7天）
 $GAPI calendar list
 
-# 创建（时间必须 ISO 8601 带时区偏移）
+# 创建：--end 或 --duration 二选一
 $GAPI calendar create \
   --summary "Sprint Planning" \
   --start 2026-04-21T10:00:00-05:00 \
-  --end 2026-04-21T11:30:00-05:00 \
+  --duration 1h30m \
   --location "Google Meet" \
-  --attendees "team@co.com"
+  --attendees "team@co.com"     # 传 --attendees 时自动 sendUpdates=all
 
-# 删除
-$GAPI calendar delete EVENT_ID --calendar primary
+# 更新（改时间 / 议程 / 参会人，只改传入的字段）
+$GAPI calendar update EVENT_ID --start 2026-04-21T11:00:00-05:00 --duration 45m
+
+# 删除；--notify 给参会人发送取消通知
+$GAPI calendar delete EVENT_ID --notify
 ```
 
 ### Tasks

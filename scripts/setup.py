@@ -30,12 +30,17 @@ import sys
 from pathlib import Path
 from typing import Optional, Tuple
 
-_SCRIPT_DIR = Path(__file__).resolve().parent
-if str(_SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPT_DIR))
-
-from _gws_env import display_state_dir, get_state_dir  # noqa: E402
-from scopes import SCOPES  # noqa: E402
+try:
+    from ._gws_common import format_missing_scopes, missing_scopes_from_payload
+    from ._gws_env import display_state_dir, get_state_dir
+    from .scopes import SCOPES
+except ImportError:
+    _SCRIPT_DIR = Path(__file__).resolve().parent
+    if str(_SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(_SCRIPT_DIR))
+    from _gws_common import format_missing_scopes, missing_scopes_from_payload  # type: ignore
+    from _gws_env import display_state_dir, get_state_dir  # type: ignore
+    from scopes import SCOPES  # type: ignore
 
 _STATE_DIR = get_state_dir()
 TOKEN_PATH = _STATE_DIR / "google_token.json"
@@ -55,23 +60,6 @@ def _load_token_payload(path: Path = TOKEN_PATH) -> dict:
         return json.loads(path.read_text())
     except Exception:
         return {}
-
-
-def _missing_scopes_from_payload(payload: dict) -> list[str]:
-    raw = payload.get("scopes") or payload.get("scope")
-    if not raw:
-        return []
-    granted = {s.strip() for s in (raw.split() if isinstance(raw, str) else raw) if s.strip()}
-    return sorted(scope for scope in SCOPES if scope not in granted)
-
-
-def _format_missing_scopes(missing_scopes: list[str]) -> str:
-    bullets = "\n".join(f"  - {scope}" for scope in missing_scopes)
-    return (
-        "Token is valid but missing required Google Workspace scopes:\n"
-        f"{bullets}\n"
-        "Run the Google Workspace setup again from this same profile directory to refresh consent."
-    )
 
 
 def install_deps():
@@ -126,9 +114,9 @@ def check_auth():
 
     payload = _load_token_payload(TOKEN_PATH)
     if creds.valid:
-        missing_scopes = _missing_scopes_from_payload(payload)
+        missing_scopes = missing_scopes_from_payload(payload)
         if missing_scopes:
-            print(f"AUTH_SCOPE_MISMATCH: {_format_missing_scopes(missing_scopes)}")
+            print(f"AUTH_SCOPE_MISMATCH: {format_missing_scopes(missing_scopes)}")
             return False
         print(f"AUTHENTICATED: Token valid at {TOKEN_PATH}")
         return True
@@ -137,9 +125,9 @@ def check_auth():
         try:
             creds.refresh(Request())
             TOKEN_PATH.write_text(creds.to_json())
-            missing_scopes = _missing_scopes_from_payload(_load_token_payload(TOKEN_PATH))
+            missing_scopes = missing_scopes_from_payload(_load_token_payload(TOKEN_PATH))
             if missing_scopes:
-                print(f"AUTH_SCOPE_MISMATCH: {_format_missing_scopes(missing_scopes)}")
+                print(f"AUTH_SCOPE_MISMATCH: {format_missing_scopes(missing_scopes)}")
                 return False
             print(f"AUTHENTICATED: Token refreshed at {TOKEN_PATH}")
             return True
@@ -282,9 +270,9 @@ def exchange_auth_code(code: str):
 
     creds = flow.credentials
     token_payload = json.loads(creds.to_json())
-    missing_scopes = _missing_scopes_from_payload(token_payload)
+    missing_scopes = missing_scopes_from_payload(token_payload)
     if missing_scopes:
-        print(f"ERROR: Refusing to save incomplete Google Workspace token. {_format_missing_scopes(missing_scopes)}")
+        print(f"ERROR: Refusing to save incomplete Google Workspace token. {format_missing_scopes(missing_scopes)}")
         print(f"Existing token at {TOKEN_PATH} was left unchanged.")
         sys.exit(1)
 

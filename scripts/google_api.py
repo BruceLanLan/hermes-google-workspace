@@ -28,31 +28,41 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import mimetypes
+import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email import encoders
 from pathlib import Path
 
-_SCRIPT_DIR = Path(__file__).resolve().parent
-if str(_SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPT_DIR))
-
-from _gws_env import display_state_dir, get_state_dir  # noqa: E402
-from scopes import SCOPES  # noqa: E402
+try:
+    from ._gws_common import api_call, format_missing_scopes, missing_scopes_from_payload, print_json
+    from ._gws_env import display_state_dir, get_state_dir
+    from .scopes import SCOPES
+except ImportError:
+    _SCRIPT_DIR = Path(__file__).resolve().parent
+    if str(_SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(_SCRIPT_DIR))
+    from _gws_common import api_call, format_missing_scopes, missing_scopes_from_payload, print_json  # type: ignore
+    from _gws_env import display_state_dir, get_state_dir  # type: ignore
+    from scopes import SCOPES  # type: ignore
 
 TOKEN_PATH = get_state_dir() / "google_token.json"
 
 
-def _missing_scopes() -> list[str]:
+def _load_token_payload() -> dict:
     try:
-        payload = json.loads(TOKEN_PATH.read_text())
+        return json.loads(TOKEN_PATH.read_text())
     except Exception:
-        return []
-    raw = payload.get("scopes") or payload.get("scope")
-    if not raw:
-        return []
-    granted = {s.strip() for s in (raw.split() if isinstance(raw, str) else raw) if s.strip()}
-    return sorted(scope for scope in SCOPES if scope not in granted)
+        return {}
+
+
+def _missing_scopes() -> list:
+    return missing_scopes_from_payload(_load_token_payload())
 
 
 def get_credentials():
@@ -98,6 +108,71 @@ def build_service(api, version):
 # Gmail
 # =========================================================================
 
+def _extract_gmail_body(payload: dict) -> str:
+    """Return the best-effort text body from a Gmail message payload."""
+    if payload.get("body", {}).get("data"):
+        return base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
+
+    parts = payload.get("parts") or []
+    # Prefer text/plain, fall back to text/html, then recurse into multiparts.
+    for mt in ("text/plain", "text/html"):
+        for part in parts:
+            if part.get("mimeType") == mt and part.get("body", {}).get("data"):
+                return base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
+    for part in parts:
+        if part.get("mimeType", "").startswith("multipart/"):
+            nested = _extract_gmail_body(part)
+            if nested:
+                return nested
+    return ""
+
+
+def _build_mime_message(
+    *,
+    to: str,
+    subject: str,
+    body: str,
+    html: bool,
+    cc: str = "",
+    bcc: str = "",
+    attachments=None,
+    extra_headers=None,
+):
+    attachments = attachments or []
+    extra_headers = extra_headers or {}
+    subtype = "html" if html else "plain"
+
+    if attachments:
+        root = MIMEMultipart()
+        root.attach(MIMEText(body, subtype, "utf-8"))
+        for path_str in attachments:
+            path = Path(path_str).expanduser().resolve()
+            if not path.exists():
+                raise FileNotFoundError(f"Attachment not found: {path}")
+            ctype, _ = mimetypes.guess_type(str(path))
+            maintype, subt = (ctype or "application/octet-stream").split("/", 1)
+            with open(path, "rb") as fh:
+                part = MIMEBase(maintype, subt)
+                part.set_payload(fh.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", "attachment", filename=path.name)
+            root.attach(part)
+        message = root
+    else:
+        message = MIMEText(body, subtype, "utf-8")
+
+    message["to"] = to
+    message["subject"] = subject
+    if cc:
+        message["cc"] = cc
+    if bcc:
+        message["bcc"] = bcc
+    for k, v in extra_headers.items():
+        message[k] = v
+    return message
+
+
+@api_call
 def gmail_search(args):
     service = build_service("gmail", "v1")
     results = service.users().messages().list(
@@ -105,7 +180,11 @@ def gmail_search(args):
     ).execute()
     messages = results.get("messages", [])
     if not messages:
-        print("No messages found.")
+        print_json([])
+        return
+
+    if args.format == "ids":
+        print("\n".join(m["id"] for m in messages))
         return
 
     output = []
@@ -125,9 +204,10 @@ def gmail_search(args):
             "snippet": msg.get("snippet", ""),
             "labels": msg.get("labelIds", []),
         })
-    print(json.dumps(output, indent=2, ensure_ascii=False))
+    print_json(output)
 
 
+@api_call
 def gmail_get(args):
     service = build_service("gmail", "v1")
     msg = service.users().messages().get(
@@ -135,57 +215,58 @@ def gmail_get(args):
     ).execute()
 
     headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
-
-    # Extract body text
-    body = ""
-    payload = msg.get("payload", {})
-    if payload.get("body", {}).get("data"):
-        body = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
-    elif payload.get("parts"):
-        for part in payload["parts"]:
-            if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
-                body = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
-                break
-        if not body:
-            for part in payload["parts"]:
-                if part.get("mimeType") == "text/html" and part.get("body", {}).get("data"):
-                    body = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
-                    break
+    body = _extract_gmail_body(msg.get("payload", {}))
 
     result = {
         "id": msg["id"],
         "threadId": msg["threadId"],
         "from": headers.get("From", ""),
         "to": headers.get("To", ""),
+        "cc": headers.get("Cc", ""),
         "subject": headers.get("Subject", ""),
         "date": headers.get("Date", ""),
         "labels": msg.get("labelIds", []),
         "body": body,
     }
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+    if args.format == "text":
+        print(f"From: {result['from']}\nTo: {result['to']}\nDate: {result['date']}\nSubject: {result['subject']}\n\n{body}")
+    elif args.format == "markdown":
+        print(
+            f"# {result['subject']}\n\n"
+            f"- **From:** {result['from']}\n"
+            f"- **To:** {result['to']}\n"
+            f"- **Date:** {result['date']}\n"
+            f"- **Labels:** {', '.join(result['labels'])}\n\n"
+            f"---\n\n{body}"
+        )
+    else:
+        print_json(result)
 
 
+@api_call
 def gmail_send(args):
     service = build_service("gmail", "v1")
-    message = MIMEText(args.body, "html" if args.html else "plain")
-    message["to"] = args.to
-    message["subject"] = args.subject
-    if args.cc:
-        message["cc"] = args.cc
-
+    message = _build_mime_message(
+        to=args.to,
+        subject=args.subject,
+        body=args.body,
+        html=args.html,
+        cc=args.cc,
+        bcc=args.bcc,
+        attachments=args.attachment or [],
+    )
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
     body = {"raw": raw}
-
     if args.thread_id:
         body["threadId"] = args.thread_id
-
     result = service.users().messages().send(userId="me", body=body).execute()
-    print(json.dumps({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")}, indent=2))
+    print_json({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")})
 
 
+@api_call
 def gmail_reply(args):
     service = build_service("gmail", "v1")
-    # Fetch original to get thread ID and headers
     original = service.users().messages().get(
         userId="me", id=args.message_id, format="metadata",
         metadataHeaders=["From", "Subject", "Message-ID"],
@@ -193,30 +274,37 @@ def gmail_reply(args):
     headers = {h["name"]: h["value"] for h in original.get("payload", {}).get("headers", [])}
 
     subject = headers.get("Subject", "")
-    if not subject.startswith("Re:"):
+    if not subject.lower().startswith("re:"):
         subject = f"Re: {subject}"
 
-    message = MIMEText(args.body)
-    message["to"] = headers.get("From", "")
-    message["subject"] = subject
+    extra = {}
     if headers.get("Message-ID"):
-        message["In-Reply-To"] = headers["Message-ID"]
-        message["References"] = headers["Message-ID"]
+        extra["In-Reply-To"] = headers["Message-ID"]
+        extra["References"] = headers["Message-ID"]
 
+    message = _build_mime_message(
+        to=headers.get("From", ""),
+        subject=subject,
+        body=args.body,
+        html=args.html,
+        attachments=args.attachment or [],
+        extra_headers=extra,
+    )
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
     body = {"raw": raw, "threadId": original["threadId"]}
-
     result = service.users().messages().send(userId="me", body=body).execute()
-    print(json.dumps({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")}, indent=2))
+    print_json({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")})
 
 
+@api_call
 def gmail_labels(args):
     service = build_service("gmail", "v1")
     results = service.users().labels().list(userId="me").execute()
     labels = [{"id": l["id"], "name": l["name"], "type": l.get("type", "")} for l in results.get("labels", [])]
-    print(json.dumps(labels, indent=2))
+    print_json(labels)
 
 
+@api_call
 def gmail_modify(args):
     service = build_service("gmail", "v1")
     body = {}
@@ -225,7 +313,7 @@ def gmail_modify(args):
     if args.remove_labels:
         body["removeLabelIds"] = args.remove_labels.split(",")
     result = service.users().messages().modify(userId="me", id=args.message_id, body=body).execute()
-    print(json.dumps({"id": result["id"], "labels": result.get("labelIds", [])}, indent=2))
+    print_json({"id": result["id"], "labels": result.get("labelIds", [])})
 
 
 # =========================================================================
@@ -245,6 +333,35 @@ def _ensure_rfc3339_z_if_naive(iso: str) -> str:
     return iso + "Z"
 
 
+_DURATION_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?$")
+
+
+def _parse_duration(text: str) -> timedelta:
+    """Parse '1h', '30m', '1h30m' (case-insensitive) into a timedelta."""
+    if not text:
+        raise ValueError("empty duration")
+    m = _DURATION_RE.fullmatch(text.strip().lower())
+    if not m or (not m.group(1) and not m.group(2)):
+        raise ValueError(f"Invalid duration {text!r}; expected '<H>h', '<M>m' or '<H>h<M>m'")
+    hours = int(m.group(1) or 0)
+    minutes = int(m.group(2) or 0)
+    return timedelta(hours=hours, minutes=minutes)
+
+
+def _add_to_iso(start_iso: str, delta: timedelta) -> str:
+    """Add a timedelta to an ISO-8601 datetime string while preserving tz info."""
+    # Python <3.11 doesn't accept trailing Z in fromisoformat.
+    text = start_iso.replace("Z", "+00:00") if start_iso.endswith("Z") else start_iso
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError as e:
+        raise ValueError(f"--start is not a valid ISO 8601 datetime: {start_iso!r}") from e
+    end = dt + delta
+    iso = end.isoformat()
+    return iso.replace("+00:00", "Z") if start_iso.endswith("Z") else iso
+
+
+@api_call
 def calendar_list(args):
     service = build_service("calendar", "v3")
     now = datetime.now(timezone.utc)
@@ -268,15 +385,19 @@ def calendar_list(args):
             "status": e.get("status", ""),
             "htmlLink": e.get("htmlLink", ""),
         })
-    print(json.dumps(events, indent=2, ensure_ascii=False))
+    print_json(events)
 
 
+@api_call
 def calendar_create(args):
     service = build_service("calendar", "v3")
+    if not args.end and not args.duration:
+        raise SystemExit("calendar create requires --end or --duration")
+    end = args.end or _add_to_iso(args.start, _parse_duration(args.duration))
     event = {
         "summary": args.summary,
         "start": {"dateTime": args.start},
-        "end": {"dateTime": args.end},
+        "end": {"dateTime": end},
     }
     if args.location:
         event["location"] = args.location
@@ -285,32 +406,89 @@ def calendar_create(args):
     if args.attendees:
         event["attendees"] = [{"email": e.strip()} for e in args.attendees.split(",")]
 
-    result = service.events().insert(calendarId=args.calendar, body=event).execute()
-    print(json.dumps({
+    result = service.events().insert(
+        calendarId=args.calendar,
+        body=event,
+        sendUpdates="all" if args.attendees else "none",
+    ).execute()
+    print_json({
         "status": "created",
         "id": result["id"],
         "summary": result.get("summary", ""),
+        "start": event["start"]["dateTime"],
+        "end": event["end"]["dateTime"],
         "htmlLink": result.get("htmlLink", ""),
-    }, indent=2))
+    })
 
 
+@api_call
+def calendar_update(args):
+    service = build_service("calendar", "v3")
+    patch: dict = {}
+    if args.summary:
+        patch["summary"] = args.summary
+    if args.location:
+        patch["location"] = args.location
+    if args.description:
+        patch["description"] = args.description
+    if args.start:
+        patch["start"] = {"dateTime": args.start}
+    if args.end:
+        patch["end"] = {"dateTime": args.end}
+    elif args.duration:
+        if not args.start:
+            existing = service.events().get(calendarId=args.calendar, eventId=args.event_id).execute()
+            start_iso = existing.get("start", {}).get("dateTime") or existing.get("start", {}).get("date", "")
+        else:
+            start_iso = args.start
+        patch["end"] = {"dateTime": _add_to_iso(start_iso, _parse_duration(args.duration))}
+    if args.attendees is not None:
+        patch["attendees"] = (
+            [{"email": e.strip()} for e in args.attendees.split(",") if e.strip()]
+            if args.attendees else []
+        )
+
+    if not patch:
+        raise SystemExit("calendar update requires at least one field to change")
+
+    result = service.events().patch(
+        calendarId=args.calendar,
+        eventId=args.event_id,
+        body=patch,
+        sendUpdates="all" if "attendees" in patch else "none",
+    ).execute()
+    print_json({
+        "status": "updated",
+        "id": result["id"],
+        "summary": result.get("summary", ""),
+        "htmlLink": result.get("htmlLink", ""),
+    })
+
+
+@api_call
 def calendar_delete(args):
     service = build_service("calendar", "v3")
-    service.events().delete(calendarId=args.calendar, eventId=args.event_id).execute()
-    print(json.dumps({"status": "deleted", "eventId": args.event_id}))
+    service.events().delete(
+        calendarId=args.calendar,
+        eventId=args.event_id,
+        sendUpdates="all" if args.notify else "none",
+    ).execute()
+    print_json({"status": "deleted", "eventId": args.event_id})
 
 
 # =========================================================================
 # Tasks
 # =========================================================================
 
+@api_call
 def tasks_tasklists(args):
     service = build_service("tasks", "v1")
     items = service.tasklists().list().execute().get("items", [])
     out = [{"id": x["id"], "title": x.get("title", ""), "updated": x.get("updated", "")} for x in items]
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+    print_json(out)
 
 
+@api_call
 def tasks_list(args):
     service = build_service("tasks", "v1")
     results = service.tasks().list(
@@ -329,9 +507,10 @@ def tasks_list(args):
             "due": t.get("due", ""),
             "updated": t.get("updated", ""),
         })
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+    print_json(out)
 
 
+@api_call
 def tasks_add(args):
     service = build_service("tasks", "v1")
     body = {"title": args.title}
@@ -344,9 +523,10 @@ def tasks_add(args):
             task=task["id"],
             body={"due": args.due},
         ).execute()
-    print(json.dumps(task, indent=2, ensure_ascii=False))
+    print_json(task)
 
 
+@api_call
 def tasks_complete(args):
     service = build_service("tasks", "v1")
     task = service.tasks().patch(
@@ -354,27 +534,28 @@ def tasks_complete(args):
         task=args.task,
         body={"status": "completed"},
     ).execute()
-    print(json.dumps({"status": "completed", "id": task.get("id"), "title": task.get("title")}, indent=2))
+    print_json({"status": "completed", "id": task.get("id"), "title": task.get("title")})
 
 
 # =========================================================================
 # Drive
 # =========================================================================
 
+@api_call
 def drive_search(args):
     service = build_service("drive", "v3")
     query = f"fullText contains '{args.query}'" if not args.raw_query else args.query
     results = service.files().list(
         q=query, pageSize=args.max, fields="files(id, name, mimeType, modifiedTime, webViewLink)",
     ).execute()
-    files = results.get("files", [])
-    print(json.dumps(files, indent=2, ensure_ascii=False))
+    print_json(results.get("files", []))
 
 
 # =========================================================================
 # Contacts
 # =========================================================================
 
+@api_call
 def contacts_list(args):
     service = build_service("people", "v1")
     results = service.people().connections().list(
@@ -387,26 +568,31 @@ def contacts_list(args):
         names = person.get("names", [{}])
         emails = person.get("emailAddresses", [])
         phones = person.get("phoneNumbers", [])
+        name = names[0].get("displayName", "") if names else ""
+        if args.name and args.name.lower() not in name.lower():
+            continue
         contacts.append({
-            "name": names[0].get("displayName", "") if names else "",
+            "name": name,
             "emails": [e.get("value", "") for e in emails],
             "phones": [p.get("value", "") for p in phones],
         })
-    print(json.dumps(contacts, indent=2, ensure_ascii=False))
+    print_json(contacts)
 
 
 # =========================================================================
 # Sheets
 # =========================================================================
 
+@api_call
 def sheets_get(args):
     service = build_service("sheets", "v4")
     result = service.spreadsheets().values().get(
         spreadsheetId=args.sheet_id, range=args.range,
     ).execute()
-    print(json.dumps(result.get("values", []), indent=2, ensure_ascii=False))
+    print_json(result.get("values", []))
 
 
+@api_call
 def sheets_update(args):
     service = build_service("sheets", "v4")
     values = json.loads(args.values)
@@ -415,9 +601,13 @@ def sheets_update(args):
         spreadsheetId=args.sheet_id, range=args.range,
         valueInputOption="USER_ENTERED", body=body,
     ).execute()
-    print(json.dumps({"updatedCells": result.get("updatedCells", 0), "updatedRange": result.get("updatedRange", "")}, indent=2))
+    print_json({
+        "updatedCells": result.get("updatedCells", 0),
+        "updatedRange": result.get("updatedRange", ""),
+    })
 
 
+@api_call
 def sheets_append(args):
     service = build_service("sheets", "v4")
     values = json.loads(args.values)
@@ -426,17 +616,17 @@ def sheets_append(args):
         spreadsheetId=args.sheet_id, range=args.range,
         valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS", body=body,
     ).execute()
-    print(json.dumps({"updatedCells": result.get("updates", {}).get("updatedCells", 0)}, indent=2))
+    print_json({"updatedCells": result.get("updates", {}).get("updatedCells", 0)})
 
 
 # =========================================================================
 # Docs
 # =========================================================================
 
+@api_call
 def docs_get(args):
     service = build_service("docs", "v1")
     doc = service.documents().get(documentId=args.doc_id).execute()
-    # Extract plain text from the document structure
     text_parts = []
     for element in doc.get("body", {}).get("content", []):
         paragraph = element.get("paragraph", {})
@@ -444,12 +634,11 @@ def docs_get(args):
             text_run = pe.get("textRun", {})
             if text_run.get("content"):
                 text_parts.append(text_run["content"])
-    result = {
+    print_json({
         "title": doc.get("title", ""),
         "documentId": doc.get("documentId", ""),
         "body": "".join(text_parts),
-    }
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    })
 
 
 # =========================================================================
@@ -457,7 +646,15 @@ def docs_get(args):
 # =========================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Google Workspace API CLI")
+    parser = argparse.ArgumentParser(
+        prog="gws",
+        description="Google Workspace API CLI (Gmail, Calendar, Tasks, Sheets, Docs, Drive, Contacts)",
+    )
+    try:
+        from . import __version__ as pkg_version  # type: ignore
+    except ImportError:
+        pkg_version = "dev"
+    parser.add_argument("--version", action="version", version=f"gws {pkg_version}")
     sub = parser.add_subparsers(dest="service", required=True)
 
     # --- Gmail ---
@@ -467,10 +664,22 @@ def main():
     p = gmail_sub.add_parser("search")
     p.add_argument("query", help="Gmail search query (e.g. 'is:unread')")
     p.add_argument("--max", type=int, default=10)
+    p.add_argument(
+        "--format",
+        choices=["json", "ids"],
+        default="json",
+        help="json (default) returns message metadata; ids returns newline-separated message IDs",
+    )
     p.set_defaults(func=gmail_search)
 
     p = gmail_sub.add_parser("get")
     p.add_argument("message_id")
+    p.add_argument(
+        "--format",
+        choices=["json", "text", "markdown"],
+        default="json",
+        help="Output format (default json; markdown is easy for agents to summarize)",
+    )
     p.set_defaults(func=gmail_get)
 
     p = gmail_sub.add_parser("send")
@@ -478,13 +687,22 @@ def main():
     p.add_argument("--subject", required=True)
     p.add_argument("--body", required=True)
     p.add_argument("--cc", default="")
+    p.add_argument("--bcc", default="")
     p.add_argument("--html", action="store_true", help="Send body as HTML")
     p.add_argument("--thread-id", default="", help="Thread ID for threading")
+    p.add_argument(
+        "--attachment",
+        action="append",
+        default=[],
+        help="Path to a file to attach (repeatable)",
+    )
     p.set_defaults(func=gmail_send)
 
     p = gmail_sub.add_parser("reply")
     p.add_argument("message_id", help="Message ID to reply to")
     p.add_argument("--body", required=True)
+    p.add_argument("--html", action="store_true")
+    p.add_argument("--attachment", action="append", default=[])
     p.set_defaults(func=gmail_reply)
 
     p = gmail_sub.add_parser("labels")
@@ -510,16 +728,34 @@ def main():
     p = cal_sub.add_parser("create")
     p.add_argument("--summary", required=True)
     p.add_argument("--start", required=True, help="Start (ISO 8601 with timezone)")
-    p.add_argument("--end", required=True, help="End (ISO 8601 with timezone)")
+    p.add_argument("--end", default="", help="End (ISO 8601 with timezone); or pass --duration")
+    p.add_argument("--duration", default="", help="Friendly length: 30m, 1h, 1h30m")
     p.add_argument("--location", default="")
     p.add_argument("--description", default="")
     p.add_argument("--attendees", default="", help="Comma-separated email addresses")
     p.add_argument("--calendar", default="primary")
     p.set_defaults(func=calendar_create)
 
+    p = cal_sub.add_parser("update")
+    p.add_argument("event_id")
+    p.add_argument("--summary", default="")
+    p.add_argument("--start", default="")
+    p.add_argument("--end", default="")
+    p.add_argument("--duration", default="")
+    p.add_argument("--location", default="")
+    p.add_argument("--description", default="")
+    p.add_argument(
+        "--attendees",
+        default=None,
+        help="Comma-separated emails; pass empty string to clear",
+    )
+    p.add_argument("--calendar", default="primary")
+    p.set_defaults(func=calendar_update)
+
     p = cal_sub.add_parser("delete")
     p.add_argument("event_id")
     p.add_argument("--calendar", default="primary")
+    p.add_argument("--notify", action="store_true", help="Notify attendees of cancellation")
     p.set_defaults(func=calendar_delete)
 
     # --- Tasks ---
@@ -571,6 +807,7 @@ def main():
 
     p = con_sub.add_parser("list")
     p.add_argument("--max", type=int, default=50)
+    p.add_argument("--name", default="", help="Case-insensitive substring filter on display name")
     p.set_defaults(func=contacts_list)
 
     # --- Sheets ---

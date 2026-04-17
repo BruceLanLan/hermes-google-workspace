@@ -1,6 +1,6 @@
 {
   "name": "hermes-google-workspace",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Google Workspace OAuth + CLI for AI agents (Hermes, OpenClaw, Claude Code, etc.)",
   "license": "MIT",
   "repository": {
