@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Google Workspace API CLI for Hermes Agent.
+"""Google Workspace API CLI (Hermes, OpenClaw, Claude Code, or any terminal agent).
 
 A thin CLI wrapper around Google's Python client libraries.
 Authenticates using the token stored by setup.py.
@@ -17,7 +17,13 @@ Usage:
   python google_api.py sheets update SHEET_ID RANGE --values '[[...]]'
   python google_api.py sheets append SHEET_ID RANGE --values '[[...]]'
   python google_api.py docs get DOC_ID
+  python google_api.py tasks tasklists
+  python google_api.py tasks list --tasklist TASKLIST_ID
+  python google_api.py tasks add --tasklist TASKLIST_ID --title "Buy milk" [--due RFC3339]
+  python google_api.py tasks complete --tasklist TASKLIST_ID --task TASK_ID
 """
+
+from __future__ import annotations
 
 import argparse
 import base64
@@ -27,23 +33,14 @@ from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
 
-try:
-    from hermes_constants import display_hermes_home, get_hermes_home
-except ModuleNotFoundError:
-    HERMES_AGENT_ROOT = Path(__file__).resolve().parents[4]
-    if HERMES_AGENT_ROOT.exists():
-        sys.path.insert(0, str(HERMES_AGENT_ROOT))
-    from hermes_constants import display_hermes_home, get_hermes_home
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
-HERMES_HOME = get_hermes_home()
-TOKEN_PATH = HERMES_HOME / "google_token.json"
+from _gws_env import display_state_dir, get_state_dir  # noqa: E402
+from scopes import SCOPES  # noqa: E402
 
-SCOPES = [
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/tasks",
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/documents.readonly",
-]
+TOKEN_PATH = get_state_dir() / "google_token.json"
 
 
 def _missing_scopes() -> list[str]:
@@ -85,7 +82,7 @@ def get_credentials():
         for scope in missing_scopes:
             print(f"  - {scope}", file=sys.stderr)
         print(
-            f"Re-run setup.py from the active Hermes profile ({display_hermes_home()}) to restore full access.",
+            f"Re-run setup.py for profile directory {display_state_dir()} to restore full access.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -235,16 +232,24 @@ def gmail_modify(args):
 # Calendar
 # =========================================================================
 
+def _ensure_rfc3339_z_if_naive(iso: str) -> str:
+    """Append Z for datetimes that omit a timezone (Calendar API expects RFC3339)."""
+    if "T" not in iso:
+        return iso
+    if "Z" in iso:
+        return iso
+    t_idx = iso.index("T")
+    tail = iso[t_idx + 1 :]
+    if "+" in tail or "-" in tail:
+        return iso
+    return iso + "Z"
+
+
 def calendar_list(args):
     service = build_service("calendar", "v3")
     now = datetime.now(timezone.utc)
-    time_min = args.start or now.isoformat()
-    time_max = args.end or (now + timedelta(days=7)).isoformat()
-
-    # Ensure timezone info
-    for val in [time_min, time_max]:
-        if "T" in val and "Z" not in val and "+" not in val and "-" not in val[11:]:
-            val += "Z"
+    time_min = _ensure_rfc3339_z_if_naive(args.start or now.isoformat())
+    time_max = _ensure_rfc3339_z_if_naive(args.end or (now + timedelta(days=7)).isoformat())
 
     results = service.events().list(
         calendarId=args.calendar, timeMin=time_min, timeMax=time_max,
@@ -293,6 +298,63 @@ def calendar_delete(args):
     service = build_service("calendar", "v3")
     service.events().delete(calendarId=args.calendar, eventId=args.event_id).execute()
     print(json.dumps({"status": "deleted", "eventId": args.event_id}))
+
+
+# =========================================================================
+# Tasks
+# =========================================================================
+
+def tasks_tasklists(args):
+    service = build_service("tasks", "v1")
+    items = service.tasklists().list().execute().get("items", [])
+    out = [{"id": x["id"], "title": x.get("title", ""), "updated": x.get("updated", "")} for x in items]
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+
+def tasks_list(args):
+    service = build_service("tasks", "v1")
+    results = service.tasks().list(
+        tasklist=args.tasklist,
+        maxResults=args.max,
+        showCompleted=args.show_completed,
+    ).execute()
+    items = results.get("items", [])
+    out = []
+    for t in items:
+        out.append({
+            "id": t.get("id", ""),
+            "title": t.get("title", ""),
+            "notes": t.get("notes", ""),
+            "status": t.get("status", ""),
+            "due": t.get("due", ""),
+            "updated": t.get("updated", ""),
+        })
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+
+def tasks_add(args):
+    service = build_service("tasks", "v1")
+    body = {"title": args.title}
+    if args.notes:
+        body["notes"] = args.notes
+    task = service.tasks().insert(tasklist=args.tasklist, body=body).execute()
+    if args.due:
+        task = service.tasks().patch(
+            tasklist=args.tasklist,
+            task=task["id"],
+            body={"due": args.due},
+        ).execute()
+    print(json.dumps(task, indent=2, ensure_ascii=False))
+
+
+def tasks_complete(args):
+    service = build_service("tasks", "v1")
+    task = service.tasks().patch(
+        tasklist=args.tasklist,
+        task=args.task,
+        body={"status": "completed"},
+    ).execute()
+    print(json.dumps({"status": "completed", "id": task.get("id"), "title": task.get("title")}, indent=2))
 
 
 # =========================================================================
@@ -395,7 +457,7 @@ def docs_get(args):
 # =========================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Google Workspace API for Hermes Agent")
+    parser = argparse.ArgumentParser(description="Google Workspace API CLI")
     sub = parser.add_subparsers(dest="service", required=True)
 
     # --- Gmail ---
@@ -459,6 +521,39 @@ def main():
     p.add_argument("event_id")
     p.add_argument("--calendar", default="primary")
     p.set_defaults(func=calendar_delete)
+
+    # --- Tasks ---
+    tsk = sub.add_parser("tasks")
+    tsk_sub = tsk.add_subparsers(dest="action", required=True)
+
+    p = tsk_sub.add_parser("tasklists")
+    p.set_defaults(func=tasks_tasklists)
+
+    p = tsk_sub.add_parser("list")
+    p.add_argument("--tasklist", required=True, help="Task list id (from tasks tasklists)")
+    p.add_argument("--max", type=int, default=100)
+    p.add_argument(
+        "--show-completed",
+        action="store_true",
+        help="Include completed tasks (default: incomplete only)",
+    )
+    p.set_defaults(func=tasks_list)
+
+    p = tsk_sub.add_parser("add")
+    p.add_argument("--tasklist", required=True)
+    p.add_argument("--title", required=True)
+    p.add_argument("--notes", default="")
+    p.add_argument(
+        "--due",
+        default="",
+        help="RFC3339 due datetime, e.g. 2026-04-20T00:00:00.000Z (uses insert+patch)",
+    )
+    p.set_defaults(func=tasks_add)
+
+    p = tsk_sub.add_parser("complete")
+    p.add_argument("--tasklist", required=True)
+    p.add_argument("--task", required=True, help="Task id from tasks list")
+    p.set_defaults(func=tasks_complete)
 
     # --- Drive ---
     drv = sub.add_parser("drive")

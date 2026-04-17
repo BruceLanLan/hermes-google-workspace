@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Google Workspace OAuth2 setup for Hermes Agent.
+"""Google Workspace OAuth2 setup (Hermes, OpenClaw, or any agent/CLI).
 
 Fully non-interactive — designed to be driven by the agent via terminal commands.
 The agent mediates between this script and the user (works on CLI, Telegram, Discord, etc.)
@@ -21,32 +21,26 @@ Agent workflow:
   6. Run --check to verify. Done.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional, Tuple
 
-try:
-    from hermes_constants import display_hermes_home, get_hermes_home
-except ModuleNotFoundError:
-    HERMES_AGENT_ROOT = Path(__file__).resolve().parents[4]
-    if HERMES_AGENT_ROOT.exists():
-        sys.path.insert(0, str(HERMES_AGENT_ROOT))
-    from hermes_constants import display_hermes_home, get_hermes_home
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
-HERMES_HOME = get_hermes_home()
-TOKEN_PATH = HERMES_HOME / "google_token.json"
-CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
-PENDING_AUTH_PATH = HERMES_HOME / "google_oauth_pending.json"
+from _gws_env import display_state_dir, get_state_dir  # noqa: E402
+from scopes import SCOPES  # noqa: E402
 
-SCOPES = [
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/tasks",
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
+_STATE_DIR = get_state_dir()
+TOKEN_PATH = _STATE_DIR / "google_token.json"
+CLIENT_SECRET_PATH = _STATE_DIR / "google_client_secret.json"
+PENDING_AUTH_PATH = _STATE_DIR / "google_oauth_pending.json"
 
 REQUIRED_PACKAGES = ["google-api-python-client", "google-auth-oauthlib", "google-auth-httplib2"]
 
@@ -76,7 +70,7 @@ def _format_missing_scopes(missing_scopes: list[str]) -> str:
     return (
         "Token is valid but missing required Google Workspace scopes:\n"
         f"{bullets}\n"
-        "Run the Google Workspace setup again from this same Hermes profile to refresh consent."
+        "Run the Google Workspace setup again from this same profile directory to refresh consent."
     )
 
 
@@ -175,6 +169,7 @@ def store_client_secret(path: str):
         print("Download the correct file from: https://console.cloud.google.com/apis/credentials")
         sys.exit(1)
 
+    CLIENT_SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
     CLIENT_SECRET_PATH.write_text(json.dumps(data, indent=2))
     print(f"OK: Client secret saved to {CLIENT_SECRET_PATH}")
 
@@ -214,7 +209,7 @@ def _load_pending_auth() -> dict:
     return data
 
 
-def _extract_code_and_state(code_or_url: str) -> tuple[str, str | None]:
+def _extract_code_and_state(code_or_url: str) -> Tuple[str, Optional[str]]:
     """Accept either a raw auth code or the full redirect URL pasted by the user."""
     if not code_or_url.startswith("http"):
         return code_or_url, None
@@ -293,10 +288,11 @@ def exchange_auth_code(code: str):
         print(f"Existing token at {TOKEN_PATH} was left unchanged.")
         sys.exit(1)
 
+    TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
     TOKEN_PATH.write_text(json.dumps(token_payload, indent=2))
     PENDING_AUTH_PATH.unlink(missing_ok=True)
     print(f"OK: Authenticated. Token saved to {TOKEN_PATH}")
-    print(f"Profile-scoped token location: {display_hermes_home()}/google_token.json")
+    print(f"Profile directory: {display_state_dir()} (google_token.json)")
 
 
 def revoke():
@@ -332,7 +328,7 @@ def revoke():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Google Workspace OAuth setup for Hermes")
+    parser = argparse.ArgumentParser(description="Google Workspace OAuth setup")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--check", action="store_true", help="Check if auth is valid (exit 0=yes, 1=no)")
     group.add_argument("--client-secret", metavar="PATH", help="Store OAuth client_secret.json")

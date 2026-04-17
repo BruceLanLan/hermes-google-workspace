@@ -26,3 +26,6 @@ htmlcov/
 # Env
 .env
 .env.local
+
+# Node (optional npx / local npm install)
+node_modules/

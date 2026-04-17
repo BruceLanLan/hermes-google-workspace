@@ -1,8 +1,10 @@
-# Hermes Google Workspace Skill
+# Google Workspace × AI Agent
 
-让 Hermes Agent 原生接入 Google Workspace（Gmail、Calendar、Tasks、Sheets、Docs、Drive），通过 OAuth2 无缝认证，支持完整的增删改查操作。
+[English README →](README.en.md)
 
-**适用于**：需要 AI 助手直接操作 Google 文档、日历、邮件、任务表的用户
+让 **任意能在终端里执行命令**的 AI（Hermes、OpenClaw、Claude Code、Cursor Agent等）通过 **同一套 OAuth2 + CLI** 读写你的 Google Workspace：Gmail、Calendar、Tasks、Sheets、Docs（读）、Drive（读）、Contacts。
+
+设计理念：**Agent 只负责编排**（把 URL 发给用户、收集重定向 URL、确认写操作），**凭证与 API 调用落在本仓库的 Python 脚本上**，因此不绑定某一款聊天产品。
 
 ---
 
@@ -10,316 +12,205 @@
 
 | 服务 | 支持操作 |
 |------|---------|
-| **Gmail** | 搜索、读取、发送、回复、管理标签 |
-| **Google Calendar** | 列出事件、创建事件、删除事件 |
-| **Google Tasks** | 列出任务列表、列出任务、创建任务（两步：insert + patch） |
-| **Google Sheets** | 读取范围、写入、追加行 |
-| **Google Docs** | 读取文档内容（纯文本） |
-| **Google Drive** | 搜索文件、按 MIME 类型筛选 |
-| **Google Contacts** | 读取联系人 |
+| **Gmail** | 搜索、读取、发送、回复、标签 |
+| **Calendar** | 列出 / 创建 / 删除事件 |
+| **Tasks** | 任务列表、列出任务、添加（含 due）、标记完成 |
+| **Sheets** | 读范围、写入、追加行 |
+| **Docs** | 读取正文（纯文本） |
+| **Drive** | 搜索（只读） |
+| **Contacts** | 列出联系人（People API） |
+
+写入类操作建议由 Agent **先展示草稿再执行**（策略层；本仓库 CLI 会直接调用 Google API）。
 
 ---
 
-## 快速安装
+## 架构要点（审阅结论摘要）
 
-### 前置要求
+| 项目 | 说明 |
+|------|------|
+| **OAuth scope单一来源** |所有 scope 只在 `scripts/scopes.py` 定义，`setup.py` 与 `google_api.py` 统一导入，避免「授权了 A、CLI 却要 B」的隐性故障。 |
+| **Profile 目录** | 由 `scripts/_gws_env.py` 解析：可选 `GOOGLE_WORKSPACE_STATE_DIR`，否则 Hermes 内用 `hermes_constants`，再否则 `HERMES_HOME` / `OPENCLAW_HOME`，默认 `~/.hermes`（兼容旧版）。 |
+| **独立仓库可运行** | 旧版在找不到 `hermes_constants` 时用错误的 `Path.parents[4]` 回退，会在独立 clone 下 **IndexError**；已改为不依赖该回退。 |
+| **Calendar list时区** | 已修复「在 for 循环里改局部变量但未写回 `time_min` / `time_max`」导致 RFC3339 未补 `Z` 的问题。 |
+| **Gmail / Contacts** | 旧版文档宣称支持，但 OAuth 列表未包含对应 scope；已在 `scopes.py` 中补齐（升级后需 **重新授权**）。 |
+| **Tasks** | 已提供 `google_api.py tasks …` 子命令，无需再手写 Python 片段。 |
 
-- Hermes Agent 已安装（任何平台：CLI / Telegram / Slack / Discord）
-- Python 3.8+
-- Google 账号
+---
 
-### Step 1：安装 Skill
+## 环境要求
+
+- Python **3.8+**（推荐3.11+）
+- Google 账号 / Workspace- 在 [Google Cloud Console](https://console.cloud.google.com/apis/credentials) 创建 **Desktop OAuth客户端**，并启用所需 API（含 **People API** 若要用通讯录）
+
+---
+
+## 安装方式
+
+### A. Hermes 内置（若你的发行版提供）
 
 ```bash
 hermes skills install google-workspace
 ```
 
-或者手动安装：
+### B. 克隆本仓库（最通用）
 
 ```bash
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-SKILL_DIR="$HERMES_HOME/skills/productivity/google-workspace"
-mkdir -p "$SKILL_DIR/scripts" "$SKILL_DIR/references"
-
-# 复制脚本
-cp scripts/setup.py "$SKILL_DIR/scripts/"
-cp scripts/google_api.py "$SKILL_DIR/scripts/"
-cp references/gmail-search-syntax.md "$SKILL_DIR/references/"
+git clone https://github.com/BruceLanLan/hermes-google-workspace.git
+cd hermes-google-workspace
 ```
 
-### Step 2：配置 shorthand（每次会话）
+依赖可在首次 `setup.py` 时自动安装，或手动：
 
 ```bash
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-GWORKSPACE_SKILL_DIR="$HERMES_HOME/skills/productivity/google-workspace"
+python3 -m pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
+```
+
+### C. npm / npx（可选，需 Node）
+
+本仓库提供 `gws` / `gws-setup` 两个 bin，实质是调用上面的 Python 脚本。发布至 npm 后可用：
+
+```bash
+npx -y -p hermes-google-workspace gws-setup --check
+npx -y -p hermes-google-workspace gws gmail search "is:unread" --max 5
+```
+
+在包未上架前，可用本地路径或 GitHub 源（视 npm 版本支持情况而定）：
+
+```bash
+npx -y -p github:BruceLanLan/hermes-google-workspace gws-setup --help
+```
+
+也可全局安装后直接使用 `gws` / `gws-setup`：
+
+```bash
+npm install -g github:BruceLanLan/hermes-google-workspace
+gws-setup --check
+```
+
+指定 Python：`GWS_PYTHON=/usr/bin/python3 gws calendar list`
+
+---
+
+## 命令别名（推荐给 Agent 的 shell 片段）
+
+把 `GWORKSPACE_SKILL_DIR` 换成你的克隆路径；若在 Hermes skill 目录，则换成 `$HERMES_HOME/skills/productivity/google-workspace`。
+
+```bash
+GWORKSPACE_SKILL_DIR="$HOME/src/hermes-google-workspace"
 PYTHON_BIN="${HERMES_PYTHON:-python3}"
-if [ -x "$HERMES_HOME/hermes-agent/venv/bin/python" ]; then
+if [ -x "${HERMES_HOME:-}/hermes-agent/venv/bin/python" ]; then
   PYTHON_BIN="$HERMES_HOME/hermes-agent/venv/bin/python"
 fi
 GSETUP="$PYTHON_BIN $GWORKSPACE_SKILL_DIR/scripts/setup.py"
 GAPI="$PYTHON_BIN $GWORKSPACE_SKILL_DIR/scripts/google_api.py"
 ```
 
-### Step 3：检查是否已认证
+非 Hermes 的 CLI 助手建议显式设置状态目录，避免与别的工具混用 token：
 
 ```bash
-$GSETUP --check
-# 输出 AUTHENTICATED → 跳过 Step 4，直接看使用
+export GOOGLE_WORKSPACE_STATE_DIR="$HOME/.config/google-workspace-cli"
 ```
 
 ---
 
-## OAuth 配置（Step 4）
+## OAuth 配置流程
 
-如果你有现成的 OAuth 客户端 JSON 文件，跳过 Step A 直接到 Step B。
+1. **`$GSETUP --check`** — 已认证则退出码 0，可跳过。
+2. **`$GSETUP --client-secret /path/to/client_secret.json`** — 保存客户端密钥。
+3. （高级）若需减少权限：编辑 **`scripts/scopes.py`**，删去不需要的 scope，再重新授权。
+4. **`$GSETUP --auth-url`** — 将打印的 URL 发给最终用户在浏览器打开。
+5. 用户授权后，浏览器会跳到 `http://localhost:1/?...`，让用户把 **地址栏完整 URL** 贴回。
+6. **`$GSETUP --auth-code '粘贴的 URL 或 code'`**
+7. **`$GSETUP --check`** — 应输出 `AUTHENTICATED`。
 
-### Step A：创建 Google Cloud OAuth 客户端（一次性，~5 分钟）
-
-1. 打开 [Google Cloud Console](https://console.cloud.google.com/apis/credentials)
-2. 创建项目（或使用已有项目）
-3. 点击 **Enable APIs**，启用你需要的 API：
-   - Gmail API
-   - Google Calendar API
-   - Google Tasks API
-   - Google Sheets API
-   - Google Docs API
-   - Google Drive API
-   - Google People API（通讯录）
-4. 进入 **Credentials** → **Create Credentials** → **OAuth 2.0 Client ID**
-5. Application type 选 **Desktop app** → 创建
-6. 点击 **Download JSON**，把文件路径告诉 Hermes
-
-### Step B：告知 Hermes 客户端文件路径
-
-```bash
-$GSETUP --client-secret /path/to/client_secret.json
-```
-
-### Step C：确认 SCOPES（在两个文件中必须完全一致）
-
-编辑这两个文件，保留你需要的 SCOPES：
-
-**`scripts/setup.py`**（约第 43 行）：
-```python
-SCOPES = [
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/tasks",
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
-```
-
-**`scripts/google_api.py`**（约第 41 行）：
-```python
-SCOPES = [
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/tasks",
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/documents.readonly",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
-```
-
-> ⚠️ **两个文件的 SCOPES 必须完全一致**，否则 OAuth exchange 会失败（"Scope has changed"）。
-
-### Step D：获取授权 URL
-
-```bash
-$GSETUP --auth-url
-```
-
-把输出的 URL **发送给用户**，让用户在浏览器中打开并授权。
-
-### Step E：用户授权后，交换 Token
-
-用户授权后，浏览器会跳转到 `http://localhost:1/?state=...&code=...`。
-让用户**复制浏览器地址栏的完整 URL** 粘贴给 Hermes：
-
-```bash
-$GSETUP --auth-code "用户粘贴的URL"
-```
-
-> ⚠️ 每个 auth code 只能使用一次。如果中途修改了 SCOPES，必须重新执行 Step D 获取新 URL。
-
-### Step F：验证
-
-```bash
-$GSETUP --check
-# 输出 AUTHENTICATED → 安装完成
-```
+撤销：`$GSETUP --revoke`
 
 ---
 
-## 使用示例
-
-> **注意**：发送邮件、创建/删除事件等写入操作，Agent 会先展示草稿内容并征得用户确认后再执行。
+## CLI 示例
 
 ### Gmail
 
 ```bash
-# 搜索邮件
 $GAPI gmail search "is:unread newer_than:1d" --max 10
-
-# 读取邮件正文
 $GAPI gmail get MESSAGE_ID
-
-# 发送邮件（发送前会确认草稿）
 $GAPI gmail send --to user@example.com --subject "Hello" --body "Message" --html
-
-# 回复邮件（自动 threading）
-$GAPI gmail reply MESSAGE_ID --body "Thanks for your reply!"
-
-# 管理标签
+$GAPI gmail reply MESSAGE_ID --body "Thanks!"
 $GAPI gmail labels
 $GAPI gmail modify MESSAGE_ID --add-labels STARRED --remove-labels UNREAD
 ```
 
-> Gmail 搜索语法参考：`skill_view("google-workspace", file_path="references/gmail-search-syntax.md")`
+Gmail 搜索语法见 `references/gmail-search-syntax.md`。
 
-### Google Calendar
+### Calendar
 
 ```bash
-# 列出未来7天事件
 $GAPI calendar list
-
-# 列出指定时间段
 $GAPI calendar list --start 2026-04-20T00:00:00Z --end 2026-04-25T23:59:59Z
-
-# 创建事件（时间必须带时区）
 $GAPI calendar create \
   --summary "Team Standup" \
   --start 2026-04-20T09:00:00-05:00 \
   --end 2026-04-20T09:30:00-05:00 \
-  --location "Zoom" \
   --attendees "alice@co.com,bob@co.com"
-
-# 删除事件
 $GAPI calendar delete EVENT_ID
 ```
 
-### Google Tasks（需要直接 Python 调用）
-
-Tasks API 通过 `google_api.py` 暴露为子命令方式不可用（CLI 只支持 Gmail/Calendar/Drive/Contacts/Sheets/Docs），但可以通过 Python 脚本直接调用：
-
-```python
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from datetime import datetime, timedelta, timezone
-
-hermes_home = "/root/.hermes"
-TOKEN_PATH = f"{hermes_home}/google_token.json"
-SCOPES = [
-    "https://www.googleapis.com/auth/tasks",
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/documents.readonly",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
-creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-tasks = build("tasks", "v1", credentials=creds)
-
-# 列出任务列表
-tasklists = tasks.tasklists().list().execute().get("items", [])
-for tl in tasklists:
-    print(f"List: {tl['title']} — id: {tl['id']}")
-
-# 列出任务（在指定列表中）
-TASKLIST_ID = "MDM0NzU4Njk2MzQ1NTg1ODI4MDk6MDow"
-tasks_in_list = tasks.tasks().list(tasklist=TASKLIST_ID).execute().get("items", [])
-for t in tasks_in_list:
-    print(f"  - {t.get('title')} (due: {t.get('due', 'none')})")
-
-# 创建任务（注意：due date 需要分两步设置）
-task = tasks.tasks().insert(
-    tasklist=TASKLIST_ID,
-    body={"title": "Review Q4 Report", "notes": "Check numbers before sending"}
-).execute()
-# 再 patch 添加 due date
-tasks.tasks().patch(
-    tasklist=TASKLIST_ID, task=task["id"],
-    body={"due": (datetime.now(timezone.utc) + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")}
-).execute()
-```
-
-### Google Sheets
+### Tasks
 
 ```bash
-# 读取范围数据
-$GAPI sheets get "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms" "Sheet1!A1:D10"
+$GAPI tasks tasklists
+$GAPI tasks list --tasklist TASKLIST_ID
+$GAPI tasks add --tasklist TASKLIST_ID --title "Buy milk" --due "2026-04-20T00:00:00.000Z"
+$GAPI tasks complete --tasklist TASKLIST_ID --task TASK_ID
+```
 
-# 写入数据
+### Sheets / Docs / Drive / Contacts
+
+```bash
+$GAPI sheets get "SHEET_ID" "Sheet1!A1:D10"
 $GAPI sheets update "SHEET_ID" "Sheet1!A1:B2" --values '[["Name","Score"],["Alice","95"]]'
-
-# 追加行
-$GAPI sheets append "SHEET_ID" "Sheet1!A:C" --values '[["Bob","92"]]'
-```
-
-### Google Docs
-
-```bash
-# 读取文档（返回纯文本）
 $GAPI docs get DOC_ID
-```
-
-### Google Drive
-
-```bash
-# 全文搜索
 $GAPI drive search "quarterly report" --max 10
-
-# 按文件类型搜索
-$GAPI drive search "mimeType='application/vnd.google-apps.spreadsheet'" --raw-query --max 5
+$GAPI contacts list --max 20
 ```
 
 ---
 
-## 扩展现有认证（添加新 Scope）
+## 与 Slack / Discord / Telegram / 微信 的关系
 
-如果已经认证了部分服务，想添加新的 Scope（如从 Calendar 扩展到 Gmail）：
+这些渠道 **不负责实现 Google API**；只要对应 Agent 运行时能执行你配置的 `$GSETUP` / `$GAPI`（或 `gws` / `gws-setup`），流程与本地 CLI 相同：发授权链接 → 用户浏览器授权 → 粘贴重定向 URL → 之后即可在同一 profile 下调 CLI。
 
-1. 在 `scripts/setup.py` 和 `scripts/google_api.py` 的 SCOPES 中添加新 scope
-2. 重新获取授权 URL：`$GSETUP --auth-url`
-3. 用户重新授权：`$GSETUP --auth-code "URL"`
-4. 验证：`$GSETUP --check`
-
-> ⚠️ auth code 只能使用一次，且修改 SCOPES 后必须重新授权。
-
----
-
-## 卸载 / 撤销权限
-
-```bash
-$GSETUP --revoke
-```
+微信若无法直接跑本地命令，需要你在 **能执行脚本的宿主机** 上完成 OAuth，并把 `GOOGLE_WORKSPACE_STATE_DIR` 指到该宿主机上的 token 目录。
 
 ---
 
 ## 故障排除
 
-| 问题 | 原因 | 解决方法 |
-|------|------|---------|
-| `NOT_AUTHENTICATED` | 未完成 OAuth | 按 Step 4 完成配置 |
-| `REFRESH_FAILED` | Token 被撤销 | 重新授权 |
-| `HttpError 403: Insufficient Permission` | Scope 不包含该 API | 重新授权，添加对应 scope |
-| `HttpError 403: Access Not Configured` | Google Cloud Console 未启用该 API | 用户去 https://console.cloud.google.com/apis/library 启用 |
-| `HttpError 403: The caller does not have permission` (Sheets) | 文件未与 OAuth 客户端共享 | 让文件所有者分享给你 |
-| `ModuleNotFoundError` | 未安装依赖 | `$GSETUP --install-deps` |
-| Advanced Protection 阻止授权 | 账号启用了高级保护 | Workspace 管理员需要将 OAuth 客户端 ID 加入白名单 |
+| 现象 | 处理 |
+|------|------|
+| `NOT_AUTHENTICATED` | 完成 OAuth 流程 |
+| `AUTH_SCOPE_MISMATCH` / `Insufficient Permission` | 检查 `scripts/scopes.py`，修改后重新授权 |
+| `ModuleNotFoundError` | `$GSETUP --install-deps` 或手动 pip安装 |
+| `Access Not Configured` | Cloud Console 启用对应 API |
+| 从 2.1 之前的版本升级后出现 Gmail/通讯录 403 | 新 scope 需重新走 `--auth-url` / `--auth-code` |
 
 ---
 
-## 项目结构
+## 仓库结构
 
 ```
 hermes-google-workspace/
-├── README.md                          # 本文件
-├── SKILL.md                           # Hermes Skill 定义文件
+├── README.md / README.en.md
+├── SKILL.md                 # Hermes skill 元数据 + 说明
+├── package.json             # 可选 npx / npm 全局安装
+├── bin/gws.cjs / gws-setup.cjs
 ├── scripts/
-│   ├── setup.py                       # OAuth 配置脚本
-│   └── google_api.py                  # Google API CLI 封装
+│   ├── scopes.py            # 唯一 OAuth scope 列表
+│   ├── _gws_env.py          # token 目录解析
+│   ├── setup.py             # OAuth
+│   └── google_api.py        # CLI
 └── references/
-    └── gmail-search-syntax.md        # Gmail 搜索语法参考
+    └── gmail-search-syntax.md
 ```
 
 ---

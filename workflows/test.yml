@@ -33,3 +33,24 @@ jobs:
       - name: Check google_api.py help
         run: |
           python scripts/google_api.py --help
+
+      - name: OAuth scopes must live only in scripts/scopes.py
+        run: |
+          python <<'PY'
+          import pathlib
+          import re
+          bad = []
+          for p in pathlib.Path("scripts").glob("*.py"):
+              if p.name == "scopes.py":
+                  continue
+              text = p.read_text(encoding="utf-8")
+              if re.search(r"^SCOPES\s*=\s*\[", text, re.M):
+                  bad.append(p.name)
+          if bad:
+              raise SystemExit(f"Move SCOPES to scripts/scopes.py only; also found in: {bad}")
+          PY
+
+      - name: npx-style bins resolve to Python CLIs
+        run: |
+          node bin/gws.cjs calendar list --help
+          node bin/gws-setup.cjs --help

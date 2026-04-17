@@ -1,0 +1,31 @@
+{
+  "name": "hermes-google-workspace",
+  "version": "2.1.0",
+  "description": "Google Workspace OAuth + CLI for AI agents (Hermes, OpenClaw, Claude Code, etc.)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BruceLanLan/hermes-google-workspace.git"
+  },
+  "keywords": [
+    "google-workspace",
+    "gmail",
+    "google-calendar",
+    "oauth2",
+    "hermes",
+    "ai-agent",
+    "cli"
+  ],
+  "bin": {
+    "gws": "bin/gws.cjs",
+    "gws-setup": "bin/gws-setup.cjs"
+  },
+  "files": [
+    "bin",
+    "scripts",
+    "references",
+    "SKILL.md",
+    "README.md",
+    "README.en.md"
+  ]
+}
