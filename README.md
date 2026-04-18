@@ -282,7 +282,6 @@ hermes-google-workspace/
  </picture>
 </a>
 
-
 ## License
 
 MIT
